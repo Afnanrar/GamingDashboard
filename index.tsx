@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { GoogleGenAI } from "@google/genai";
+import { auth, db } from "./supabase";
 
 // --- TYPES AND INTERFACES ---
 interface Business {
@@ -14,6 +15,7 @@ interface Business {
     phone: string;
     password: string;
     logo?: string;
+    auth_user_id?: string; // Add this for Supabase auth integration
 }
 
 type UserRole = 'Admin' | 'Entry Agent';
@@ -102,6 +104,8 @@ interface AppState {
     isLoadingAi: boolean;
     aiInsights: Record<Page, string | null>;
     modal: ModalState;
+    isAuthenticated: boolean;
+    authUser: any | null;
     settings: {
         pageNames: string[];
         platforms: string[];
@@ -213,6 +217,8 @@ const APP_STATE: AppState = {
     isLoadingAi: false,
     aiInsights: { home: null, login: null, registerBusiness: null, roleSelection: null, submit: null, daily: null, monthly: null, referral: null, progress: null, upload: null, settings: null, manageAgents: null },
     modal: { type: null, data: null },
+    isAuthenticated: false,
+    authUser: null,
     settings: {
         pageNames: [...PAGE_NAMES_CONST],
         platforms: [...PLATFORMS_CONST],
@@ -265,18 +271,37 @@ function navigateTo(page: Page) {
     }
 }
 
-function handleBusinessLogin(email: string, password: string): void {
-    const business = APP_STATE.businesses.find(b => b.email.toLowerCase() === email.toLowerCase() && b.password === password);
-    if (business) {
-        setState({
-            currentBusiness: business,
-            currentPage: 'roleSelection',
-            role: null,
-            currentUser: null
-        });
-        showAlert(`Welcome, ${business.businessName}!`, 'success');
-    } else {
-        showAlert('Invalid email or password.', 'error');
+async function handleBusinessLogin(email: string, password: string): Promise<void> {
+    try {
+        const { data, error } = await auth.signIn(email, password)
+        
+        if (error) {
+            showAlert(`Login failed: ${error.message}`, 'error')
+            return
+        }
+
+        if (data.user) {
+            // Get business data from database
+            const { data: businessData, error: businessError } = await db.getBusinessByEmail(email)
+
+            if (businessError || !businessData) {
+                showAlert('Business account not found. Please register first.', 'error')
+                return
+            }
+
+            setState({
+                currentBusiness: businessData,
+                currentPage: 'roleSelection',
+                role: null,
+                currentUser: null,
+                isAuthenticated: true,
+                authUser: data.user
+            })
+            showAlert(`Welcome, ${businessData.business_name}!`, 'success')
+        }
+    } catch (error) {
+        console.error('Login error:', error)
+        showAlert('Login failed. Please try again.', 'error')
     }
 }
 
@@ -285,24 +310,36 @@ function login(role: UserRole, agentName: string) {
     setState({ role, currentUser: agentName, currentPage: defaultPage });
 }
 
-function logout() {
-    // If a user with a role is logged in (i.e., inside the main app),
-    // logging out should take them back to the role selection screen for the current business.
-    if (APP_STATE.role) {
-        setState({
-            role: null,
-            currentUser: null,
-            currentPage: 'roleSelection', // This prepares the state for the role selection screen.
-        });
-    } else {
-        // If no user role is active (e.g., on the role selection page),
-        // logging out should be a complete logout, clearing the business and returning to the home/login page.
+async function logout() {
+    try {
+        // Sign out from Supabase
+        const { error } = await auth.signOut()
+        if (error) {
+            console.error('Logout error:', error)
+        }
+        
+        // Clear local state
         setState({
             role: null,
             currentUser: null,
             currentBusiness: null,
             currentPage: 'home',
-        });
+            isAuthenticated: false,
+            authUser: null
+        })
+        
+        showAlert('Logged out successfully', 'success')
+    } catch (error) {
+        console.error('Logout error:', error)
+        // Still clear local state even if Supabase logout fails
+        setState({
+            role: null,
+            currentUser: null,
+            currentBusiness: null,
+            currentPage: 'home',
+            isAuthenticated: false,
+            authUser: null
+        })
     }
 }
 
@@ -372,27 +409,48 @@ function handleFilterChange(page: keyof AppState['filters'], filterName: string,
 
 // --- DATA ACTIONS ---
 
-function handleBusinessRegistration(businessData: Omit<Business, 'id' | 'token'>) {
-    // Check for duplicate email
-    if (APP_STATE.businesses.some(b => b.email.toLowerCase() === businessData.email.toLowerCase())) {
-        showAlert('A business with this email already exists.', 'error');
-        return;
+async function handleBusinessRegistration(businessData: Omit<Business, 'id' | 'token'>): Promise<void> {
+    try {
+        // First, create the user account in Supabase Auth
+        const { data: authData, error: authError } = await auth.signUp(
+            businessData.email, 
+            businessData.password,
+            {
+                business_name: businessData.businessName,
+                owner_name: businessData.ownerName
+            }
+        )
+
+        if (authError) {
+            showAlert(`Registration failed: ${authError.message}`, 'error')
+            return
+        }
+
+        if (authData.user) {
+            // Then, create the business record in our database
+            const { data: businessRecord, error: businessError } = await db.createBusiness({
+                id: authData.user.id, // Use Supabase user ID
+                business_name: businessData.businessName,
+                owner_name: businessData.ownerName,
+                email: businessData.email,
+                phone: businessData.phone,
+                password_hash: '', // We don't store password in our table
+                logo_url: businessData.logo,
+                auth_user_id: authData.user.id
+            })
+
+            if (businessError) {
+                showAlert(`Business creation failed: ${businessError.message}`, 'error')
+                return
+            }
+
+            showAlert('Business registered successfully! Please check your email to verify your account.', 'success')
+            navigateTo('login')
+        }
+    } catch (error) {
+        console.error('Registration error:', error)
+        showAlert('Registration failed. Please try again.', 'error')
     }
-
-    const newBusiness: Business = {
-        ...businessData,
-        id: `biz_${Date.now()}`,
-        token: `token_${Math.random().toString(36).substr(2, 9)}`,
-    };
-
-    const newBusinesses = [...APP_STATE.businesses, newBusiness];
-    // In a real app, you'd save this to a database. Here we save to state.
-    setState({ businesses: newBusinesses });
-
-    console.log('New business registered:', newBusiness);
-    
-    showAlert('Business registered successfully! Please log in.', 'success');
-    navigateTo('login');
 }
 
 function openModal(type: ModalState['type'], data: ModalState['data']) {
@@ -3011,4 +3069,24 @@ declare global {
 
 
 // --- INITIALIZATION ---
+
+// Set up authentication state listener
+auth.onAuthStateChange((event, session) => {
+    if (event === 'SIGNED_IN' && session) {
+        setState({ 
+            isAuthenticated: true, 
+            authUser: session.user 
+        })
+    } else if (event === 'SIGNED_OUT') {
+        setState({ 
+            isAuthenticated: false, 
+            authUser: null,
+            currentBusiness: null,
+            role: null,
+            currentUser: null
+        })
+        navigateTo('home')
+    }
+})
+
 document.addEventListener('DOMContentLoaded', render);
